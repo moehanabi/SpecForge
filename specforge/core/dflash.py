@@ -78,6 +78,7 @@ class OnlineDFlashModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        context_dropout_rate: float = 0.0,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -88,6 +89,7 @@ class OnlineDFlashModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.context_dropout_rate = context_dropout_rate
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -293,6 +295,18 @@ class OnlineDFlashModel(nn.Module):
             block_size=self.block_size,
             device=device,
         )
+
+        # --- Context Feature Dropout (Dir 2A) ---
+        if self.training and self.context_dropout_rate > 0:
+            ctx_drop_mask = torch.bernoulli(
+                torch.full(
+                    (hidden_states.shape[0], hidden_states.shape[1], 1),
+                    1.0 - self.context_dropout_rate,
+                    device=device,
+                    dtype=hidden_states.dtype,
+                )
+            )
+            hidden_states = hidden_states * ctx_drop_mask
 
         output_hidden = self.draft_model(
             position_ids=full_position_ids,
