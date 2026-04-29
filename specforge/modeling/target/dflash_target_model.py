@@ -93,6 +93,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             dtype=torch_dtype,
             enable_return_hidden_states=True,  # Critical for DFlash
             disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
             tp_size=tp_size,
             pp_size=1,
             **kwargs,

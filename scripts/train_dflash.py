@@ -232,6 +232,10 @@ def parse_args():
         default=None,
         help="LM head weight key in the target model. Default: 'lm_head.weight'.",
     )
+    model_group.add_argument(
+        "--context-dropout-rate", type=float, default=0.0,
+        help="Token-level dropout rate for context features (Dir 2A). 0 disables.",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -721,6 +725,7 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        context_dropout_rate=getattr(args, "context_dropout_rate", 0.0),
     )
 
     fsdp_kwargs = {
