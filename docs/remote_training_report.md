@@ -51,11 +51,25 @@ SpecForge 是一个投机解码（Speculative Decoding）Draft Model 在线训�
 `remote_target_client.py` 作为训练脚本的 target model backend：
 
 - 首次请求时通过 POST `/init_nccl` 初始化 NCCL 数据通道
-- 通过 POST `/setup` 获取模型配置（hidden_size, vocab_size 等）
-- 每步训练通过 POST `/generate` 发送请求 + NCCL recv 接收结果
+- 通过 POST `/get_model_info` 获取模型配置（hidden_size, vocab_size 等）
+- 通过 POST `/set_aux_hidden_states_layers`、`/set_capture_layers`、`/set_vocab_mapping` 同步训练所需配置
+- 每步训练通过 POST `/generate_eagle3_data` 或 `/generate_dflash_data` 发送请求，并通过 NCCL recv 接收结果
 - 支持 TP>1 训练：仅 rank 0 发送请求，结果 broadcast 到其他 rank
+- 首次成功连接后启动后台 heartbeat；`close()` 时 best-effort 发送 `/disconnect`
 
-### 2.3 NCCL Transport
+### 2.3 Client 生命周期与自动退出
+
+Target server 会跟踪 client 活跃状态，并在 client 退出后自动关闭，避免训练结束后遗留占用 GPU 的 server 进程：
+
+- Client 首次成功请求或 NCCL 初始化成功后，启动后台 heartbeat 线程，默认每 15 秒 POST `/heartbeat`
+- Client 正常退出时会 best-effort POST `/disconnect`，server 收到后立即触发 shutdown
+- Client 异常退出时，server watchdog 在超过 `--client-heartbeat-timeout` 后触发 shutdown（默认 60 秒）
+- Server 只把真正的 client API 计为活跃请求；`GET /health` 和无关 POST 不会续期 watchdog
+- `--client-heartbeat-timeout 0` 可关闭 server 端超时 watchdog，但 `/disconnect` 仍会触发自动关闭
+
+由于 NCCL transport 不支持在同一个 server 进程内安全地断线重连，推荐将每个 target server 进程视为单次训练 session 的资源：训练结束或 client 断开后自动退出，再为下一次训练重新启动。
+
+### 2.4 NCCL Transport
 
 `_nccl_transport.py` 实现专用 NCCL 传输层：
 
@@ -65,7 +79,7 @@ SpecForge 是一个投机解码（Speculative Decoding）Draft Model 在线训�
 - `SPECFORGE_NCCL_PORT` 控制 rendezvous 端口（默认 HTTP port + 100）
 - 安全退出：`pg.abort()` + 注销避免 `destroy_process_group` 挂起
 
-### 2.4 Prefetch 流水线
+### 2.5 Prefetch 流水线
 
 ```
 Timeline (depth=2, 2 servers round-robin):
@@ -81,7 +95,7 @@ Client:   [train1][train2][train3][train4][train5]──
 - 训练步开始时 `future.result()` 获取已完成的 prefetch 结果
 - 当 server 延迟 < 训练步时间时，server 完全被 overlap
 
-### 2.5 环境变量
+### 2.6 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
@@ -90,6 +104,7 @@ Client:   [train1][train2][train3][train4][train5]──
 | `SPECFORGE_TOPK` | `0` | Server 端 target_p top-k 压缩（`0` 为全分布） |
 | `SPECFORGE_TARGET_DTYPE` | `fp32` | target_p 计算精度 |
 | `SPECFORGE_GPU_ID` | auto | 指定 GPU 设备 ID |
+| `SPECFORGE_HEARTBEAT_INTERVAL` | `15` | Client heartbeat 发送间隔（秒，`<=0` 表示不启动 heartbeat 线程） |
 
 ## 3. 使用方法
 
@@ -204,6 +219,7 @@ export NCCL_IB_GID_INDEX=3             # RoCE GID index
 | `--mem-fraction-static` | Server | SGLang KV cache 显存比例（TP=1 用 0.4，TP=2 用 0.35） |
 | `--attention-backend` | Server | 注意力后端（推荐 flashinfer） |
 | `--nccl-port` | Server | NCCL rendezvous 端口（默认 HTTP port + 100） |
+| `--client-heartbeat-timeout` | Server | Client 无活跃请求后的自动退出超时（秒，默认 60；`0` 表示关闭 watchdog） |
 | `--host` | Server | 绑定地址（跨机必须 0.0.0.0） |
 
 ## 4. 文件索引
