@@ -58,11 +58,21 @@ class NCCLTransport:
         True for the server side (rank 0), False for client (rank 1).
     """
 
-    def __init__(self, nccl_port: int, host: str, is_server: bool):
+    def __init__(
+        self,
+        nccl_port: int,
+        host: str,
+        is_server: bool,
+        rank: Optional[int] = None,
+        world_size: int = 2,
+        peer_rank: Optional[int] = None,
+    ):
         self._nccl_port = nccl_port
         self._host = host
         self._is_server = is_server
-        self._rank = 0 if is_server else 1
+        self._rank = (0 if is_server else 1) if rank is None else rank
+        self._world_size = world_size
+        self._peer_rank = (1 if is_server else 0) if peer_rank is None else peer_rank
         self._pg: Optional[dist.ProcessGroup] = None
         self._initialized = False
         self._init_lock = threading.Lock()
@@ -97,8 +107,9 @@ class NCCLTransport:
                 )
 
                 logger.info(
-                    "NCCL transport initializing: rank=%d, host=%s, port=%d, timeout=%ds",
+                    "NCCL transport initializing: rank=%d/%d, host=%s, port=%d, timeout=%ds",
                     self._rank,
+                    self._world_size,
                     self._host,
                     self._nccl_port,
                     timeout_seconds,
@@ -112,7 +123,7 @@ class NCCLTransport:
                 store = TCPStore(
                     host_name=self._host,
                     port=self._nccl_port,
-                    world_size=2,
+                    world_size=self._world_size,
                     is_master=is_master,
                     timeout=timeout,
                     multi_tenant=True,
@@ -121,7 +132,7 @@ class NCCLTransport:
                 self._pg = init_custom_process_group(
                     backend="nccl",
                     store=store,
-                    world_size=2,
+                    world_size=self._world_size,
                     rank=self._rank,
                     group_name=self._group_name,
                     timeout=timeout,
@@ -129,7 +140,9 @@ class NCCLTransport:
 
                 self._initialized = True
                 logger.info(
-                    "NCCL transport initialized successfully (rank=%d)", self._rank
+                    "NCCL transport initialized successfully (rank=%d/%d)",
+                    self._rank,
+                    self._world_size,
                 )
                 return True
 
@@ -169,7 +182,7 @@ class NCCLTransport:
             # NCCL doesn't support int16/int8/bool — view as raw uint8 bytes
             if tensor.dtype in _NCCL_UNSUPPORTED_DTYPES:
                 tensor = tensor.view(torch.uint8)
-            dist.send(tensor, dst=1, group=self._pg)
+            dist.send(tensor, dst=self._peer_rank, group=self._pg)
 
     def recv_tensors(
         self, metadata: Dict[str, dict], keys_order: List[str]
@@ -211,11 +224,11 @@ class NCCLTransport:
                     numel *= s
                 nbytes = numel * _ELEMENT_SIZE[dtype]
                 buf = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
-                dist.recv(buf, src=0, group=self._pg)
+                dist.recv(buf, src=self._peer_rank, group=self._pg)
                 result[key] = buf.view(dtype).reshape(shape)
             else:
                 buf = torch.empty(shape, dtype=dtype, device="cuda")
-                dist.recv(buf, src=0, group=self._pg)
+                dist.recv(buf, src=self._peer_rank, group=self._pg)
                 result[key] = buf
 
         return result

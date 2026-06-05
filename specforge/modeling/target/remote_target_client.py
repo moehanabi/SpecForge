@@ -85,6 +85,13 @@ def _int_to_dtype(i: int) -> torch.dtype:
     return _INT_TO_DTYPE.get(i, torch.float32)
 
 
+def _tp_broadcast_object(tp_group, obj):
+    src = dist.get_global_rank(tp_group, 0)
+    values = [obj]
+    dist.broadcast_object_list(values, src=src, group=tp_group)
+    return values[0]
+
+
 def _tp_broadcast_tensors(
     tp_group, tp_src, tensors: List[torch.Tensor], flags: List[bool]
 ):
@@ -249,6 +256,7 @@ class RemoteModelClient:
         self._nccl_enabled = os.environ.get("SPECFORGE_ENABLE_NCCL", "1") == "1"
         self._nccl_transport: Optional[NCCLTransport] = None
         self._nccl_init_attempted = False
+        self._nccl_server_client_tp_size: Optional[int] = None
         self._nccl_init_lock = threading.Lock()
         # Heartbeat thread to keep server aware of client liveness
         self._heartbeat_interval = float(
@@ -284,7 +292,7 @@ class RemoteModelClient:
             return "127.0.0.1"
         return host
 
-    def _init_nccl(self) -> bool:
+    def _init_nccl(self, tp_group=None, notify_server: bool = True) -> bool:
         """Lazily initialize the NCCL transport (called on first request).
 
         This sends POST /init_nccl to the server, then both sides block on
@@ -293,20 +301,29 @@ class RemoteModelClient:
         Returns True on success, False on failure.
         """
         with self._nccl_init_lock:
+            client_tp_size = (
+                dist.get_world_size(tp_group) if tp_group is not None else 1
+            )
+            client_tp_rank = dist.get_rank(tp_group) if tp_group is not None else 0
             if self._nccl_transport is not None and self._nccl_transport.is_initialized:
-                return True
+                return self._nccl_server_client_tp_size == client_tp_size
             if self._nccl_init_attempted:
                 return False  # Already failed once, don't retry
 
             self._nccl_init_attempted = True
-            nccl_port = self._get_nccl_port()
+            self._nccl_server_client_tp_size = client_tp_size
+            base_nccl_port = self._get_nccl_port()
             server_host = self._get_server_host()
+            nccl_port = base_nccl_port + client_tp_rank
 
             logger.info(
-                "Initializing NCCL transport: host=%s, port=%d", server_host, nccl_port
+                "Initializing NCCL transport: host=%s, port=%d, client_tp_rank=%d/%d",
+                server_host,
+                nccl_port,
+                client_tp_rank,
+                client_tp_size,
             )
 
-            # Create client-side transport (rank 1)
             self._nccl_transport = NCCLTransport(
                 nccl_port=nccl_port,
                 host=server_host,
@@ -329,26 +346,34 @@ class RemoteModelClient:
             init_thread = threading.Thread(target=_client_init, daemon=True)
             init_thread.start()
 
-            # Tell the server to also initialize (this triggers server-side rendezvous)
-            try:
-                resp = self._session.post(
-                    f"{self.url}/init_nccl",
-                    data=json.dumps({"nccl_port": nccl_port}).encode(),
-                    timeout=180,  # generous timeout for NCCL init
-                    headers={"Content-Type": "application/json"},
-                )
-                resp.raise_for_status()
-                server_status = json.loads(resp.content.decode())
-                if server_status.get("status") not in ("ok", "already_initialized"):
-                    logger.warning("Server NCCL init returned: %s", server_status)
+            if notify_server:
+                try:
+                    resp = self._session.post(
+                        f"{self.url}/init_nccl",
+                        data=json.dumps(
+                            {
+                                "nccl_port": base_nccl_port,
+                                "client_tp_size": client_tp_size,
+                            }
+                        ).encode(),
+                        timeout=180,  # generous timeout for NCCL init
+                        headers={"Content-Type": "application/json"},
+                    )
+                    resp.raise_for_status()
+                    server_status = json.loads(resp.content.decode())
+                    if server_status.get("status") not in (
+                        "ok",
+                        "already_initialized",
+                    ):
+                        logger.warning("Server NCCL init returned: %s", server_status)
+                        self._nccl_transport = None
+                        init_thread.join(timeout=5)
+                        return False
+                except Exception as exc:
+                    logger.warning("Failed to send /init_nccl to server: %s", exc)
                     self._nccl_transport = None
                     init_thread.join(timeout=5)
                     return False
-            except Exception as exc:
-                logger.warning("Failed to send /init_nccl to server: %s", exc)
-                self._nccl_transport = None
-                init_thread.join(timeout=5)
-                return False
 
             # Wait for client-side init to complete
             init_thread.join(timeout=130)
@@ -400,7 +425,12 @@ class RemoteModelClient:
                     ) from last_exc
 
     def _request_transport(
-        self, endpoint: str, payload: bytes, map_location: str = "cpu"
+        self,
+        endpoint: str,
+        payload: bytes,
+        map_location: str = "cpu",
+        tp_group=None,
+        direct_recv: bool = False,
     ) -> dict:
         """Unified transport with auto-negotiation: NCCL > wire format.
 
@@ -412,7 +442,7 @@ class RemoteModelClient:
 
         # Lazily initialize NCCL on first request
         if self._nccl_enabled and not self._nccl_init_attempted:
-            self._init_nccl()
+            self._init_nccl(tp_group=tp_group)
 
         # Signal NCCL capability if initialized
         if self._nccl_transport is not None and self._nccl_transport.is_initialized:
@@ -435,6 +465,13 @@ class RemoteModelClient:
                 ):
                     # NCCL path: HTTP body contains only metadata (JSON)
                     # Tensors arrive via NCCL recv
+                    if direct_recv:
+                        return [
+                            decode_nccl_metadata(raw.encode("utf-8"))
+                            for raw in json.loads(resp.content.decode("utf-8"))[
+                                "rank_metadata"
+                            ]
+                        ]
                     keys_order, metadata, cpu_scalars = decode_nccl_metadata(
                         resp.content
                     )
@@ -571,6 +608,32 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         self._clients = [RemoteModelClient(u, timeout, max_retries) for u in urls]
         self._next = itertools.cycle(range(len(self._clients)))
         self._executor_cache = None
+        self._server_tp_size_cache: Optional[int] = None
+        self._logged_direct_shard_nccl = False
+
+    def _get_server_tp_size(self) -> Optional[int]:
+        if self._server_tp_size_cache is not None:
+            return self._server_tp_size_cache
+        try:
+            info = self._clients[0]._request("get_model_info", b"")
+            info_dict = _deserialize_scalar_dict(info)
+            self._server_tp_size_cache = int(info_dict.get("tp_size", 1))
+        except Exception:
+            self._server_tp_size_cache = None
+        return self._server_tp_size_cache
+
+    def _can_direct_shard_nccl(self, tp_group, shard_returns: bool) -> bool:
+        if tp_group is None or not shard_returns:
+            return False
+        if os.environ.get("SPECFORGE_ENABLE_NCCL", "1") != "1":
+            return False
+        client_tp_size = dist.get_world_size(tp_group)
+        if dist.get_rank(tp_group) == 0:
+            server_tp_size = self._get_server_tp_size()
+        else:
+            server_tp_size = None
+        server_tp_size = _tp_broadcast_object(tp_group, server_tp_size)
+        return server_tp_size == client_tp_size
 
     @staticmethod
     def _build_eagle3_payload(
@@ -581,6 +644,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         image_grid_thw=None,
         is_vlm=False,
         shard_returns: bool = False,
+        direct_shard_nccl: bool = False,
     ) -> bytes:
         """Build and serialize the Eagle3 request payload."""
         payload = {
@@ -588,6 +652,7 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
             "attention_mask": attention_mask.cpu(),
             "loss_mask": loss_mask.cpu(),
             "shard_returns": torch.tensor(bool(shard_returns)),
+            "direct_shard_nccl": torch.tensor(bool(direct_shard_nccl)),
         }
         if is_vlm and pixel_values is not None:
             payload["pixel_values"] = pixel_values.cpu()
@@ -806,6 +871,22 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         shard_returns: bool = False,
     ) -> Eagle3TargetOutput:
         """TP-aware: rank 0 sends request, broadcasts result to other ranks."""
+        if self._can_direct_shard_nccl(tp_group, shard_returns):
+            if dist.get_rank(tp_group) == 0 and not self._logged_direct_shard_nccl:
+                logger.info(
+                    "Using direct sharded NCCL transport for EAGLE3 target outputs"
+                )
+                self._logged_direct_shard_nccl = True
+            return self._generate_eagle3_data_tp_direct_nccl(
+                tp_group,
+                input_ids,
+                attention_mask,
+                loss_mask,
+                pixel_values,
+                image_grid_thw,
+                is_vlm,
+            )
+
         if dist.get_rank(tp_group) == 0:
             output = self._generate_eagle3_data_single(
                 input_ids,
@@ -821,6 +902,94 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
             )
         return self._broadcast_eagle3_output(
             tp_group, attention_mask, shard_returns=shard_returns
+        )
+
+    def _init_eagle3_direct_nccl(self, tp_group, client: RemoteModelClient) -> bool:
+        tp_rank = dist.get_rank(tp_group)
+        init_ok = client._init_nccl(tp_group=tp_group, notify_server=(tp_rank == 0))
+        init_ok_t = torch.tensor([int(init_ok)], dtype=torch.int32, device="cuda")
+        dist.all_reduce(init_ok_t, op=dist.ReduceOp.MIN, group=tp_group)
+        return bool(init_ok_t.item())
+
+    def _receive_eagle3_data_tp_direct_nccl(
+        self,
+        tp_group,
+        client: RemoteModelClient,
+        attention_mask: torch.Tensor,
+        metadata_payloads=None,
+    ) -> Eagle3TargetOutput:
+        metadata_payloads = _tp_broadcast_object(tp_group, metadata_payloads)
+        if isinstance(metadata_payloads, dict) and "error" in metadata_payloads:
+            raise RuntimeError(metadata_payloads["error"])
+        tp_rank = dist.get_rank(tp_group)
+        keys_order, metadata, cpu_scalars = metadata_payloads[tp_rank]
+        result = client._nccl_transport.recv_tensors(metadata, keys_order)
+        for k, v in cpu_scalars.items():
+            result[k] = torch.tensor(v, dtype=torch.int32)
+
+        local_attention_mask = attention_mask.chunk(
+            dist.get_world_size(tp_group), dim=0
+        )[tp_rank].contiguous()
+        return self._result_to_eagle3_output(result, local_attention_mask)
+
+    def _generate_eagle3_data_tp_direct_nccl(
+        self,
+        tp_group,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        loss_mask: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        is_vlm: bool = False,
+    ) -> Eagle3TargetOutput:
+        tp_rank = dist.get_rank(tp_group)
+        client_idx = next(self._next) if tp_rank == 0 else None
+        client_idx = _tp_broadcast_object(tp_group, client_idx)
+        client = self._clients[client_idx]
+
+        if not self._init_eagle3_direct_nccl(tp_group, client):
+            if tp_rank == 0:
+                output = self._generate_eagle3_data_single(
+                    input_ids,
+                    attention_mask,
+                    loss_mask,
+                    pixel_values,
+                    image_grid_thw,
+                    is_vlm,
+                    shard_returns=True,
+                )
+                return self._broadcast_eagle3_output(
+                    tp_group, attention_mask, output, shard_returns=True
+                )
+            return self._broadcast_eagle3_output(
+                tp_group, attention_mask, shard_returns=True
+            )
+
+        if tp_rank == 0:
+            payload_bytes = self._build_eagle3_payload(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                is_vlm=is_vlm,
+                shard_returns=True,
+                direct_shard_nccl=True,
+            )
+            try:
+                metadata_payloads = client._request_transport(
+                    "generate_eagle3_data",
+                    payload_bytes,
+                    tp_group=tp_group,
+                    direct_recv=True,
+                )
+            except Exception as exc:
+                metadata_payloads = {"error": str(exc)}
+        else:
+            metadata_payloads = None
+
+        return self._receive_eagle3_data_tp_direct_nccl(
+            tp_group, client, attention_mask, metadata_payloads
         )
 
     def _result_to_eagle3_output(
@@ -869,13 +1038,13 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
         shard_returns: bool = False,
     ) -> Eagle3TargetOutput:
         payload_bytes = self._build_eagle3_payload(
-            input_ids,
-            attention_mask,
-            loss_mask,
-            pixel_values,
-            image_grid_thw,
-            is_vlm,
-            shard_returns,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            is_vlm=is_vlm,
+            shard_returns=shard_returns,
         )
 
         client = self._clients[next(self._next)]
@@ -894,30 +1063,71 @@ class RemoteEagle3TargetModel(_RemoteTargetExecutorMixin, Eagle3TargetModel):
     ) -> _AsyncTargetHandle:
         """Submit an async forward pass and return a future-like handle."""
         tp_group = _get_tp_group_if_distributed()
-        if tp_group is not None and dist.get_rank(tp_group) != 0:
-            return _AsyncTargetHandle(
-                receive=lambda: self._broadcast_eagle3_output(
-                    tp_group, attention_mask, shard_returns=shard_returns
-                )
-            )
+        use_direct_nccl = self._can_direct_shard_nccl(tp_group, shard_returns)
+        if tp_group is not None:
+            tp_rank = dist.get_rank(tp_group)
+            if use_direct_nccl:
+                if tp_rank == 0 and not self._logged_direct_shard_nccl:
+                    logger.info(
+                        "Using direct sharded NCCL transport for EAGLE3 target outputs"
+                    )
+                    self._logged_direct_shard_nccl = True
+                client_idx = next(self._next) if tp_rank == 0 else None
+                client_idx = _tp_broadcast_object(tp_group, client_idx)
+                client = self._clients[client_idx]
+                if not self._init_eagle3_direct_nccl(tp_group, client):
+                    use_direct_nccl = False
+                elif tp_rank != 0:
+                    return _AsyncTargetHandle(
+                        receive=lambda: self._receive_eagle3_data_tp_direct_nccl(
+                            tp_group, client, attention_mask
+                        )
+                    )
+            if not use_direct_nccl:
+                if tp_rank != 0:
+                    return _AsyncTargetHandle(
+                        receive=lambda: self._broadcast_eagle3_output(
+                            tp_group, attention_mask, shard_returns=shard_returns
+                        )
+                    )
+                client = self._clients[next(self._next)]
+        else:
+            client = self._clients[next(self._next)]
 
-        client = self._clients[next(self._next)]
         # Pre-serialise payload so the background thread doesn't hold the
         # GIL across PyTorch ops in the main thread.
         payload_bytes = self._build_eagle3_payload(
-            input_ids,
-            attention_mask,
-            loss_mask,
-            pixel_values,
-            image_grid_thw,
-            is_vlm,
-            shard_returns,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            is_vlm=is_vlm,
+            shard_returns=shard_returns,
+            direct_shard_nccl=use_direct_nccl,
         )
 
         def _do_request():
-            return client._request_transport("generate_eagle3_data", payload_bytes)
+            try:
+                return client._request_transport(
+                    "generate_eagle3_data",
+                    payload_bytes,
+                    tp_group=tp_group if use_direct_nccl else None,
+                    direct_recv=use_direct_nccl,
+                )
+            except Exception as exc:
+                if use_direct_nccl:
+                    return {"error": str(exc)}
+                raise
 
         future = self._executor.submit(_do_request)
+        if use_direct_nccl:
+            return _AsyncTargetHandle(
+                future=future,
+                convert=lambda metadata_payloads: self._receive_eagle3_data_tp_direct_nccl(
+                    tp_group, client, attention_mask, metadata_payloads
+                ),
+            )
         if tp_group is None:
             return _AsyncTargetHandle(
                 future=future,

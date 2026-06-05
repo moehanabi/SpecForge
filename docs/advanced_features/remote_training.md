@@ -284,6 +284,22 @@ export NCCL_IB_GID_INDEX=3             # RoCE GID index
 | 2 | 1 | 0.2006 | 0.291 | 2.09x |
 | 2 | 2 | 0.2006 | 0.288 | **2.12x** |
 
+### EAGLE3 TP=2 Sharded NCCL Return Benchmark
+
+A separate cross-machine benchmark compares EAGLE3 TP=2 remote training with and without sharded target output return. The run used the same `mem_fraction_static=0.40` for all groups, 100 training steps, NCCL/RDMA over `mlx5_4` (`ib_write_bw` about 45.8 GB/s, NCCL smoke test `used_ib=True`).
+
+| Scenario | Depth | No-shard Avg Iter (s) | Shard Avg Iter (s) | Shard Speedup | Accuracy | Loss |
+|----------|------:|----------------------:|-------------------:|---------------:|---------:|-----:|
+| Baseline, co-located | 0 | 0.5942 | 0.5212 | 1.14x | 0.59 | 0.179653 |
+| Single remote server | 0 | 0.7244 | 0.6031 | 1.20x | 0.59 | 0.179648 |
+| Single remote server | 1 | 0.4705 | 0.3537 | 1.33x | 0.59 | 0.179648 |
+| Single remote server | 2 | 0.4707 | 0.3572 | 1.32x | 0.59 | 0.179648 |
+| Dual remote servers | 0 | 0.7216 | 0.6108 | 1.18x | 0.59 | 0.179648 |
+| Dual remote servers | 1 | 0.4706 | 0.3592 | 1.31x | 0.59 | 0.179648 |
+| Dual remote servers | 2 | 0.4298 | 0.3546 | 1.21x | 0.59 | 0.179648 |
+
+Sharded NCCL return reduces about 0.07-0.12 seconds per step in this setup. Accuracy and loss are unchanged compared with no-shard return; the optimization only reduces server-side output gather/concat and client-side receive/broadcast overhead, while target forward and draft training compute remain unchanged.
+
 ### Key Findings
 
 1. **Disaggregation alone (depth=0)** provides 3-6% speedup by eliminating GPU resource contention between target and draft models.

@@ -117,6 +117,8 @@ class TargetModelServer:
         self._nccl_port = nccl_port
         self._host = host
         self._nccl_transport: NCCLTransport = None
+        self._direct_shard_nccl = False
+        self._logged_direct_shard_nccl = False
         self._nccl_enabled = os.environ.get("SPECFORGE_ENABLE_NCCL", "1") == "1"
         # Cache env vars read on every forward pass
         self._topk = int(os.environ.get("SPECFORGE_TOPK", "0"))
@@ -275,6 +277,35 @@ class TargetModelServer:
             and self._nccl_transport.is_initialized
         )
 
+    def _prepare_nccl_response(self, data: dict) -> bytes:
+        """Prepare NCCL metadata and stash tensors for deferred send."""
+        torch.cuda.synchronize()
+        for k in list(data.keys()):
+            t = data[k]
+            if (
+                t is not None
+                and hasattr(t, "is_cuda")
+                and t.is_cuda
+                and not t.is_contiguous()
+            ):
+                data[k] = t.contiguous()
+        keys_order = [
+            k
+            for k in data.keys()
+            if data[k] is not None and hasattr(data[k], "is_cuda") and data[k].is_cuda
+        ]
+        cpu_scalars = {}
+        for k, v in data.items():
+            if (
+                v is not None
+                and isinstance(v, torch.Tensor)
+                and not v.is_cuda
+                and v.numel() <= 8
+            ):
+                cpu_scalars[k] = v.tolist()
+        self._pending_nccl_send = (data, keys_order)
+        return encode_nccl_metadata(data, keys_order, cpu_scalars=cpu_scalars)
+
     def _serialize_response(self, data: dict) -> bytes:
         """Serialise handler response dict to bytes.
 
@@ -286,37 +317,7 @@ class TargetModelServer:
         if self._keep_on_gpu:
             # NCCL: encode metadata only.  The actual send is deferred until
             # after the HTTP response is flushed (see _send_response flow).
-            torch.cuda.synchronize()
-            # Ensure all tensors are contiguous
-            for k in list(data.keys()):
-                t = data[k]
-                if (
-                    t is not None
-                    and hasattr(t, "is_cuda")
-                    and t.is_cuda
-                    and not t.is_contiguous()
-                ):
-                    data[k] = t.contiguous()
-            keys_order = [
-                k
-                for k in data.keys()
-                if data[k] is not None
-                and hasattr(data[k], "is_cuda")
-                and data[k].is_cuda
-            ]
-            # Collect CPU scalar tensors to include in metadata JSON
-            cpu_scalars = {}
-            for k, v in data.items():
-                if (
-                    v is not None
-                    and isinstance(v, torch.Tensor)
-                    and not v.is_cuda
-                    and v.numel() <= 8
-                ):
-                    cpu_scalars[k] = v.tolist()
-            # Stash data for deferred send
-            self._pending_nccl_send = (data, keys_order)
-            return encode_nccl_metadata(data, keys_order, cpu_scalars=cpu_scalars)
+            return self._prepare_nccl_response(data)
         # Default: compact wire format (no pickle)
         return _wire.encode_to_buffer(data)
 
@@ -583,6 +584,7 @@ class TargetModelServer:
                         info["hf_config_dict"] = hf_cfg.to_dict()
         info["server_model_path"] = self.model_path
         info["mode"] = self.mode
+        info["tp_size"] = self.tp_size
         return json.dumps(info, default=str).encode()
 
     def handle_init_nccl(self, raw_body: bytes) -> bytes:
@@ -597,9 +599,18 @@ class TargetModelServer:
 
         try:
             request_data = json.loads(raw_body.decode("utf-8"))
-            nccl_port = request_data.get("nccl_port", self._nccl_port)
+            base_nccl_port = request_data.get("nccl_port", self._nccl_port)
+            client_tp_size = int(request_data.get("client_tp_size", 1))
         except (json.JSONDecodeError, UnicodeDecodeError):
-            nccl_port = self._nccl_port
+            base_nccl_port = self._nccl_port
+            client_tp_size = 1
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank >= client_tp_size:
+            return json.dumps({"status": "inactive"}).encode()
+
+        self._direct_shard_nccl = client_tp_size == self.tp_size and client_tp_size > 1
+        nccl_port = base_nccl_port + rank
 
         if self._nccl_transport is not None and self._nccl_transport.is_initialized:
             return json.dumps({"status": "already_initialized"}).encode()
@@ -814,6 +825,27 @@ def _all_ranks_succeeded(success: bool) -> bool:
     return bool(flag.item())
 
 
+def _all_gather_object_from_ranks(obj):
+    out = [None] * dist.get_world_size()
+    dist.all_gather_object(out, obj)
+    return out
+
+
+def _prepare_direct_nccl_metadata_from_ranks(app, data: dict | None):
+    metadata = None
+    prepare_ok = False
+    try:
+        if data is not None:
+            metadata = app._prepare_nccl_response(data).decode("utf-8")
+            prepare_ok = True
+    except Exception:
+        logger.exception("Error preparing direct sharded NCCL metadata")
+    if not _all_ranks_succeeded(prepare_ok):
+        app._pending_nccl_send = None
+        return None
+    return _all_gather_object_from_ranks(metadata)
+
+
 def _gather_tensor_dict_to_rank0(data: dict | None) -> dict | None:
     """Gather per-rank tensor dict shards along batch dim to rank 0."""
     if not dist.is_initialized() or dist.get_world_size() == 1:
@@ -927,10 +959,10 @@ def _route_request_synced(app, path, body):
             logger.exception("Error handling %s", path)
             return json.dumps({"error": "Internal server error"}).encode(), 500
 
-    # /init_nccl must run ONLY on rank 0 — it sets up a separate 2-rank NCCL
-    # group (server rank 0 + training client rank 1).  TP worker ranks must
-    # NOT participate.  Same for /disconnect and /heartbeat.
-    if path in ("/init_nccl", "/disconnect", "/heartbeat"):
+    # /disconnect and /heartbeat are rank-0-only lifecycle endpoints.
+    # /init_nccl is broadcast so direct sharded NCCL can initialize one
+    # server_tp_i <-> client_tp_i transfer group per TP rank.
+    if path in ("/disconnect", "/heartbeat"):
         return _route_request(app, path, body)
 
     rank = dist.get_rank()
@@ -941,13 +973,20 @@ def _route_request_synced(app, path, body):
     # Non-rank-0 workers skip post-processing to avoid blocking the next step.
     if synced_path == "/generate_eagle3_data":
         out = None
+        direct_metadata = None
         shard_returns = False
+        direct_shard_nccl = False
         forward_ok = False
         try:
             payload = _deserialize_tensors(body_bytes, map_location="cpu")
             shard_returns = bool(
                 payload.get("shard_returns", torch.tensor(False)).item()
             )
+            direct_shard_nccl = bool(
+                payload.get("direct_shard_nccl", torch.tensor(False)).item()
+            )
+            if direct_shard_nccl:
+                _request_local.use_nccl = True
             out = app._run_generate_eagle3_data(
                 body_bytes, rank_only_forward=(rank != 0)
             )
@@ -957,7 +996,21 @@ def _route_request_synced(app, path, body):
         if shard_returns:
             try:
                 if _all_ranks_succeeded(forward_ok):
-                    out = _gather_tensor_dict_to_rank0(out)
+                    if direct_shard_nccl and app._direct_shard_nccl:
+                        if rank == 0 and not app._logged_direct_shard_nccl:
+                            logger.info(
+                                "Using direct sharded NCCL transport for EAGLE3 target outputs"
+                            )
+                            app._logged_direct_shard_nccl = True
+                        direct_metadata = _prepare_direct_nccl_metadata_from_ranks(
+                            app, out
+                        )
+                        if direct_metadata is None:
+                            out = None
+                        elif rank != 0:
+                            app._flush_nccl_send()
+                    else:
+                        out = _gather_tensor_dict_to_rank0(out)
                 else:
                     out = None
             except Exception:
@@ -966,6 +1019,8 @@ def _route_request_synced(app, path, body):
                 )
                 out = None
         if rank == 0:
+            if direct_metadata is not None:
+                return json.dumps({"rank_metadata": direct_metadata}).encode("utf-8")
             if out is not None:
                 return app._serialize_response(out)
             return (
@@ -1047,15 +1102,22 @@ def _worker_loop(server_app):
 
         # Heavy endpoints: worker only participates in model forward (TP allreduce),
         # skips post-processing (target_p, .cpu() transfers) since result is discarded.
+        _request_local.use_nccl = False
         if path == "/generate_eagle3_data":
             out = None
             shard_returns = False
+            direct_shard_nccl = False
             forward_ok = False
             try:
                 payload = _deserialize_tensors(body_bytes, map_location="cpu")
                 shard_returns = bool(
                     payload.get("shard_returns", torch.tensor(False)).item()
                 )
+                direct_shard_nccl = bool(
+                    payload.get("direct_shard_nccl", torch.tensor(False)).item()
+                )
+                if direct_shard_nccl:
+                    _request_local.use_nccl = True
                 out = server_app._run_generate_eagle3_data(
                     body_bytes, rank_only_forward=True
                 )
@@ -1065,7 +1127,14 @@ def _worker_loop(server_app):
             if shard_returns:
                 try:
                     if _all_ranks_succeeded(forward_ok):
-                        _gather_tensor_dict_to_rank0(out)
+                        if direct_shard_nccl and server_app._direct_shard_nccl:
+                            metadata = _prepare_direct_nccl_metadata_from_ranks(
+                                server_app, out
+                            )
+                            if metadata is not None:
+                                server_app._flush_nccl_send()
+                        else:
+                            _gather_tensor_dict_to_rank0(out)
                 except Exception:
                     logger.exception(
                         "Worker rank %d error gathering %s shards", rank, path
