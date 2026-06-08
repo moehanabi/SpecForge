@@ -350,6 +350,7 @@ def initialize_dp_attention(
         dp_attention._ATTN_TP_RANK,
         dp_attention._ATTN_TP_SIZE,
         dp_attention._ATTN_DP_RANK,
+        dp_attention._ATTN_DP_SIZE,
     ) = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
