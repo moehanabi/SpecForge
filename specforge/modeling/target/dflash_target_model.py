@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from array import array
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -230,7 +231,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=curr_ids.view(-1).tolist(),
+                origin_input_ids=array('q', curr_ids.view(-1).tolist()),
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
