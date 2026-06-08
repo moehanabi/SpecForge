@@ -1,5 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
+from array import array
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -410,8 +411,16 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
         )
         batch.prepare_for_extend()
         self._maybe_prepare_mlp_sync_batch(batch)
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+
+        # Resolve input_ids: new sglang defers H2D to resolve_forward_inputs,
+        # but we don't use the Scheduler pipeline, so do it manually.
+        if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         eagle3_output = self.model_runner.forward(forward_batch).logits_output
         input_lens = [len(req.origin_input_ids) for req in reqs]
@@ -520,7 +529,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=input_id_.view(-1).tolist(),
+                origin_input_ids=array('q', input_id_.view(-1).tolist()),
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
@@ -713,7 +722,7 @@ class SGLangEagle3TargetModel(Eagle3TargetModel):
             req = Req(
                 rid=str(idx),
                 origin_input_text="",
-                origin_input_ids=input_id_list,
+                origin_input_ids=array('q', input_id_list),
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
