@@ -172,8 +172,7 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 offload_tags=set(),
             )
 
-        model_worker_batch = batch.get_model_worker_batch()
-        forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+        forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
         output = self.model_runner.forward(forward_batch)
