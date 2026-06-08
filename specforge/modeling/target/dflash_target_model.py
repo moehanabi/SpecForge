@@ -172,6 +172,14 @@ class SGLangDFlashTargetModel(DFlashTargetModel):
                 offload_tags=set(),
             )
 
+        # Resolve input_ids: new sglang defers H2D to resolve_forward_inputs,
+        # but we don't use the Scheduler pipeline, so do it manually.
+        if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
+            batch.input_ids = batch.prefill_input_ids_cpu.to(
+                batch.device, non_blocking=True
+            )
+            batch.prefill_input_ids_cpu = None
+
         forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
